@@ -1,0 +1,251 @@
+(* ===== DATA TYPES ===== *)
+
+type Id_t.        
+type Random_t.    (* Nonce *)
+type e_t.         (* DH exponent *)
+type G_t.         (* DH group *)
+type K_t.         (* Symmetric key *)
+type PK_t.        (* Public key *)
+type SK_t.        (* Private key *)
+type MAC_t.       (* MAC *)
+type Sig_t.       (* Signature *)
+type Cert_t.      (* Certificate *)
+type Tag_t.       (* Message type tag *)
+type RR_t.         (* DNS Resource Record type *)
+
+(* ===== CHANNELS ===== *)
+
+(* Public channel *)
+free c:channel.
+
+(* ===== TABLES ===== *)
+table trusted_domains(Id_t, K_t).
+table raw_public_keys(SK_t, PK_t).
+
+(* ===== CONSTANTS ===== *) 
+
+
+(* DH generator *)
+const G:G_t.
+
+(* TLS key constants *)
+const CHTS:bitstring.
+const SHTS:bitstring.
+(* Handshake Type *)
+const CERTIFICATE:bitstring.
+const CERTIFICATE_VERIFY:bitstring.
+const FINISHED:bitstring.
+const ZERO: K_t.
+const DERIVED: bitstring.
+
+(* DNS *)
+const TLSA: RR_t.
+
+(* ===== FUNCTIONS ===== *)
+
+(* Generate a public key from a private key *)
+fun make_pk(SK_t): PK_t.
+
+
+(* Sign a certificate with a private key *)
+fun signcert(Id_t,PK_t,SK_t): Cert_t.
+
+reduc forall id:Id_t,pk:PK_t,sk:SK_t;
+  checkcert(signcert(id,pk,sk),make_pk(sk)) = (id,pk)
+.
+
+reduc forall id:Id_t,pk:PK_t,sk:SK_t;
+  readcert(signcert(id,pk,sk)) = (id,pk)
+.
+
+(* Create a certificate *)
+letfun certificate(id:Id_t,sk:SK_t) =
+  signcert(id,make_pk(sk),sk)
+.
+
+(* Sign a bitstring with a private key *)
+fun sign(bitstring,SK_t): Sig_t.
+reduc forall bs:bitstring, sk:SK_t;
+  checksign(sign(bs,sk),make_pk(sk)) = bs
+.
+
+(* Authenticated encryption/decryption *)
+fun enc(bitstring,K_t): bitstring.
+reduc forall k:K_t, m:bitstring;
+  dec(enc(m,k),k) = m
+.
+
+(* Authentication without encryption *)
+fun auth(bitstring,K_t): bitstring.
+reduc forall k:K_t, m:bitstring;
+  verify(auth(m,k),k) = m
+.
+reduc forall k:K_t, m:bitstring;
+  open(auth(m,k)) = m
+.
+
+(* Diffie-Hellman key exchange *)
+fun DH(e_t,G_t): G_t.
+equation forall x:e_t, y:e_t;
+  DH(y,DH(x,G)) = DH(x,DH(y,G))
+.
+
+(* MAC *)
+fun mac(bitstring,K_t): MAC_t.
+
+(* Hash *)
+fun hash(bitstring): bitstring.
+fun cert_hash(Cert_t): bitstring.
+
+(* KDF *)
+fun hkdf_extract(G_t,K_t): K_t.
+fun hkdf_expand_label(K_t,bitstring): K_t.
+fun derive_secret(K_t,bitstring,bitstring): K_t.
+
+fun toG(bitstring): G_t [typeConverter].
+fun toBS(G_t): bitstring [typeConverter].
+
+
+(* ===== EVENTS ===== *)
+
+event DNSUpdate(Id_t,bitstring).
+event HonestDNSUpdate(Id_t,Cert_t).
+event ServerFinished(Id_t,Cert_t,K_t).
+event ClientFinished(Id_t,Cert_t,K_t).
+event ServerComplete(Id_t,Cert_t,K_t).
+event CompromiseDomain(Id_t).
+event Test(Id_t).
+
+(* ===== QUERIES ===== *)
+
+(* DNS update sanity check *)
+query domain:Id_t, cert:Cert_t; event(DNSUpdate(domain, cert_hash(cert))) ==> event(HonestDNSUpdate(domain, cert)) || event(CompromiseDomain(domain)).
+
+(* Authentication of server to client *)
+query domain:Id_t, cert:Cert_t, ms:K_t; event(ClientFinished(domain, cert, ms)) ==> event(HonestDNSUpdate(domain, cert)) || event(CompromiseDomain(domain)).
+query domain:Id_t, cert:Cert_t, ms:K_t; event(ClientFinished(domain, cert, ms)) ==> inj-event(ServerFinished(domain, cert, ms)) || event(CompromiseDomain(domain)).
+(* Authentication of client to server *)
+query domain:Id_t, cert:Cert_t, ms:K_t; event(ServerComplete(domain, cert, ms)) ==> inj-event(ClientFinished(domain, cert, ms)) || event(CompromiseDomain(domain)).
+
+(* Reachability *)
+query domain:Id_t, cert:Cert_t, ms:K_t; event(ClientFinished(domain, cert, ms)) ==> event(CompromiseDomain(domain)).
+query domain:Id_t, cert:Cert_t, ms:K_t; event(ServerFinished(domain, cert, ms)) ==> event(CompromiseDomain(domain)).
+query domain:Id_t, cert:Cert_t, ms:K_t; event(ServerComplete(domain, cert, ms)) ==> event(CompromiseDomain(domain)).
+
+
+(* ===== PROCESSES ===== *)
+
+let client(dns_pk:PK_t) = 
+
+    in(c, TLSA_record:Sig_t);
+    let (domain:Id_t, chash:bitstring) = checksign(TLSA_record, dns_pk) in
+    (* Client hello *)
+    new chr:Random_t;
+    new x:e_t;
+    let client_hello = (chr, DH(x, G)) in
+    out(c, client_hello);
+    (* Server hello *)
+    in(c, server_hello:bitstring);
+    let (shr:Random_t, dhs:G_t) = server_hello in
+    (* Key derivation *)
+    let handshake_secret = hkdf_extract(DH(x, dhs), derive_secret(ZERO, DERIVED, ())) in
+    let shts = derive_secret(handshake_secret, SHTS, (client_hello, server_hello)) in
+    let chts = derive_secret(handshake_secret, CHTS, (client_hello, server_hello)) in
+    let master_secret = derive_secret(handshake_secret, DERIVED, ()) in
+    let sfk = hkdf_expand_label(shts, FINISHED) in
+    let cfk = hkdf_expand_label(chts, FINISHED) in
+    in(c, certificate:bitstring);
+    let(=CERTIFICATE, sscert:Cert_t) = dec(certificate, shts) in 
+    if chash = cert_hash(sscert) then
+    let(=domain, spk:PK_t) = readcert(sscert) in
+    let(=domain, =spk) = checkcert(sscert, spk) in
+    (* Verify transcript hash *)
+    in(c, certificate_verify:bitstring);
+    let (=CERTIFICATE_VERIFY, cv:Sig_t) = dec(certificate_verify, shts) in   
+    let transcript_hash = checksign(cv, spk) in
+    if transcript_hash = hash((client_hello, server_hello, certificate)) then
+    event Test(domain);
+    (* Verify server finished *)
+    in(c, server_finished:bitstring);
+    let (=FINISHED, server_finished_mac:MAC_t) = dec(server_finished, shts) in
+    if server_finished_mac = mac(hash((client_hello, server_hello, certificate, certificate_verify)), sfk) then
+    event ClientFinished(domain, sscert, master_secret);
+    (* Send client finished *)
+    let client_finished = mac(hash((client_hello, server_hello, certificate, certificate_verify, server_finished)), cfk) in
+    out(c, enc((FINISHED, client_finished), chts));
+    0.
+
+
+let TLS_server(sk:SK_t, sscert:Cert_t, domain:Id_t) = 
+    
+    (* TLS start *)
+    in(c, client_hello:bitstring);
+    let (chr:Random_t, dhc:G_t) = client_hello in
+    new shr:Random_t;
+    new y:e_t;
+    (* Server hello *)
+    let server_hello = (shr, DH(y, G)) in
+    out(c, server_hello);
+    (* Raw public key *)
+    let handshake_secret = hkdf_extract(DH(y, dhc), derive_secret(ZERO, DERIVED, ())) in
+    let shts = derive_secret(handshake_secret, SHTS, (client_hello, server_hello)) in
+    let chts = derive_secret(handshake_secret, CHTS, (client_hello, server_hello)) in
+    let master_secret = derive_secret(handshake_secret, DERIVED, ()) in
+    let sfk = hkdf_expand_label(shts, FINISHED) in
+    let cfk = hkdf_expand_label(chts, FINISHED) in
+    
+    let certificate = enc((CERTIFICATE, sscert), shts) in
+    out(c, certificate);
+    (* CertificateVerify *)
+    let transcript_hash = hash((client_hello, server_hello, certificate)) in 
+    let certificate_verify = enc((CERTIFICATE_VERIFY, sign(transcript_hash, sk)), shts) in 
+    out(c, certificate_verify);
+    (* Server finished *)
+    event ServerFinished(domain, sscert, master_secret);
+    let server_finished = enc((FINISHED,mac(hash((client_hello, server_hello, certificate, certificate_verify)), sfk)), shts) in
+    out(c, server_finished);
+    (* Client finished *)
+    in(c, client_finished: bitstring);
+    let (=FINISHED, client_finished_mac:MAC_t) = dec(client_finished, chts) in 
+    let (=client_finished_mac) = mac(hash((client_hello, server_hello, certificate, certificate_verify, server_finished)), cfk) in
+    event ServerComplete(domain, sscert, master_secret);
+    0.
+
+let server() = 
+    (* Create trusted_domains *)
+    !( 
+    new domain: Id_t; out(c, domain);
+    new credentials: K_t;
+      ( insert trusted_domains(domain, credentials) ) | 
+      ( event CompromiseDomain(domain); out(c, credentials) )
+    ) 
+    |
+    (* Create raw key pairs *)
+    !( new sk:SK_t; let rpk = make_pk(sk) in out(c, rpk);
+      insert raw_public_keys(sk, rpk) ) 
+    |
+    !( 
+      (* Honest registration of raw public keys to domains in DNS (many-to-many relation) *)
+      get trusted_domains(domain:Id_t, credentials:K_t) in 
+      get raw_public_keys(sk:SK_t, rpk:PK_t) in
+      let cert = certificate(domain, sk) in out(c, cert);
+      event HonestDNSUpdate(domain, cert);
+      out(c, auth((domain, TLSA, cert_hash(cert)), credentials));
+      (* Launch TLS servers *)
+      !TLS_server(sk, cert, domain) 
+    ).
+
+let dns(dns_sk:SK_t, dns_pk:PK_t) = 
+    in(c, TLSA_update_record: bitstring);
+    let (domain:Id_t, =TLSA, cert_hash:bitstring) = open(TLSA_update_record) in
+    get trusted_domains(=domain, credentials:K_t) in
+    let (=domain, =TLSA, =cert_hash) = verify(TLSA_update_record, credentials) in
+    out(c, sign((domain, cert_hash), dns_sk));
+    0.
+
+process 
+    new dns_sk:SK_t;
+    let dns_pk = make_pk(dns_sk) in
+    out(c, dns_pk);
+
+    !dns(dns_sk, dns_pk) | !server() | !client(dns_pk) 
